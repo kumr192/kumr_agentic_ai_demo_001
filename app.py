@@ -5,9 +5,10 @@ from openai import OpenAI
 
 # ---------------- Tools ----------------
 def get_time() -> str:
-    return dt.datetime.now().isoformat()
+    return dt.datetime.now().isoformat(timespec="seconds")
 
 def calc(expression: str) -> str:
+    # Demo-only: tight character allowlist to reduce risk.
     allowed = set("0123456789+-*/(). %")
     if any(ch not in allowed for ch in expression):
         return "Rejected: expression contains disallowed characters."
@@ -44,12 +45,14 @@ TOOLS = [
     },
 ]
 
-TOOL_MAP = {
-    "get_time": lambda args: get_time(),
-    "calc": lambda args: calc(args.get("expression", "")),
-}
+def tool_execute(tool_name: str, args: dict) -> str:
+    if tool_name == "get_time":
+        return get_time()
+    if tool_name == "calc":
+        return calc(args.get("expression", ""))
+    return f"Unknown tool: {tool_name}"
 
-# ---------------- Agent loop ----------------
+# ---------------- Agent loop (tool calling) ----------------
 def run_agent(user_text: str, api_key: str):
     client = OpenAI(api_key=api_key)
 
@@ -58,8 +61,8 @@ def run_agent(user_text: str, api_key: str):
             "role": "system",
             "content": (
                 "You are a helpful assistant. "
-                "You may call tools when useful. "
-                "If a tool is required to answer, call it."
+                "Use tools when they help. "
+                "If you call a tool, do it explicitly."
             ),
         },
         {"role": "user", "content": user_text},
@@ -67,49 +70,55 @@ def run_agent(user_text: str, api_key: str):
 
     tool_log = []
 
-    # Allow a few tool calls max
+    # up to 3 rounds of tool use
     for _ in range(3):
-        resp = client.responses.create(
-            model="gpt-4.1-mini",
-            input=messages,
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
             tools=TOOLS,
+            tool_choice="auto",
         )
 
-        tool_calls = [item for item in resp.output if item.type == "tool_call"]
+        msg = resp.choices[0].message
 
-        # If no tool calls, return the final text
-        if not tool_calls:
-            final_text = "".join(
-                [item.text for item in resp.output if item.type == "output_text"]
-            )
-            return final_text.strip(), tool_log
+        # No tool calls => final answer
+        if not msg.tool_calls:
+            return (msg.content or "").strip(), tool_log
 
-        # Execute tools and append results
-        for tc in tool_calls:
-            name = tc.name
-            raw_args = tc.arguments or "{}"
+        # IMPORTANT: append the assistant message that contains the tool calls
+        messages.append(
+            {
+                "role": "assistant",
+                "content": msg.content,
+                "tool_calls": [tc.model_dump() for tc in msg.tool_calls],
+            }
+        )
 
+        # Execute each tool call and append tool results
+        for tc in msg.tool_calls:
+            tool_name = tc.function.name
+            raw_args = tc.function.arguments or "{}"
             try:
                 args = json.loads(raw_args)
             except Exception:
                 args = {}
 
-            tool_log.append({"tool": name, "arguments": args})
+            tool_log.append({"tool": tool_name, "arguments": args})
 
-            if name not in TOOL_MAP:
-                result = f"Unknown tool: {name}"
-            else:
-                result = TOOL_MAP[name](args)
+            result = tool_execute(tool_name, args)
 
             messages.append(
-                {"role": "tool", "tool_call_id": tc.id, "content": str(result)}
+                {
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": str(result),
+                }
             )
 
     return "Stopped: too many tool calls.", tool_log
 
-
 # ---------------- UI ----------------
-st.set_page_config(page_title="BYOK Agentic Tool Demo", page_icon="🛠️", layout="centered")
+st.set_page_config(page_title="Agentic Tool-Calling Demo (BYOK)", page_icon="🛠️", layout="centered")
 st.title("Agentic Tool-Calling Demo (BYOK)")
 
 if "api_key" not in st.session_state:
@@ -132,9 +141,7 @@ with st.sidebar:
         "This server must receive your key to call OpenAI."
     )
 
-user_text = st.text_input(
-    "Your prompt", placeholder="Try: What time is it and compute (19*7)+3"
-)
+user_text = st.text_input("Your prompt", placeholder="Try: What time is it and compute (19*7)+3")
 
 if st.button("Run"):
     api_key = (st.session_state.api_key or "").strip()
@@ -145,7 +152,7 @@ if st.button("Run"):
         st.warning("Type something first.")
     else:
         try:
-            answer, tool_log = run_agent(user_text, api_key)
+            answer, tool_log = run_agent(user_text.strip(), api_key)
 
             if tool_log:
                 st.subheader("Tool calls")
@@ -153,6 +160,5 @@ if st.button("Run"):
 
             st.subheader("Answer")
             st.write(answer)
-
         except Exception as e:
             st.error(f"Runtime error: {e}")
